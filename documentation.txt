@@ -1,0 +1,19 @@
+﻿Lab 3: Amazed
+
+
+ForkJoinSolver implements a parallel depth-first search algorithm for solving mazes. We are adding parallelism using Java’s fork/join framework.
+
+
+The solver starts at the maze’s start node, creating a "player". It uses a stack to explore nodes depth-first. Each node is visited at most once using a shared thread-safe 'visited' set. The 'predecessor' map keeps track of how we reached each node, so we can reconstruct the path once a goal is found.
+
+
+To explore multiple branches at the same time, the solver forks new children after a certain number of steps (forkAfter). Each forked solver continues the search independently, sharing the 'visited' set and 'predecessor' map to avoid revisiting nodes. An AtomicBoolean flag 'goalFound' ensures that once a goal is reached, all threads stop exploring.
+
+
+When a goal is found, the solver reconstructs the path from the start to the goal by following the predecessors. If the goal is found in a forked child, the parent solver combines its path with the child’s path to produce the full route.
+
+
+All shared structures are thread-safe, making the algorithm lock-free. Each node is visited at most once, and the search terminates in finite time, regardless of maze size or number of threads.
+
+
+So, ForkJoinSolver achieves an efficient parallel maze exploration while remaining safe and easy to understand.
