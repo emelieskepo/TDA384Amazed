@@ -2,42 +2,57 @@ package amazed.solver;
 
 import amazed.maze.Maze;
 
-import java.util.*;
-import java.util.concurrent.*;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.Set;
+import java.util.Stack;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.RecursiveTask;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * ForkJoinSolver — parallell DFS med rekursiv forking vid korsningar.
- * Föräldern spawnar barn i korsningar (fler än 1 väg).
- * Barnen kan i sin tur spawn:a egna barn längre fram.
+ * <code>ForkJoinSolver</code> implements a solver for
+ * <code>Maze</code> objects using a fork/join multi-thread
+ * depth-first search.
  */
 public class ForkJoinSolver extends SequentialSolver {
 
-    private final Set<Integer> sharedVisited;
-    private final Map<Integer, Integer> sharedPredecessor;
-    private final AtomicBoolean goalFound;
-    private final int taskStart;
+    // Shared flag to indicate that the goal has been found
+    private static final AtomicBoolean goalFound = new AtomicBoolean(false);
 
-    public ForkJoinSolver(Maze maze, int forkAfter) {
+    // List of sub-solvers for forked tasks
+    private final List<ForkJoinSolver> subSolvers = new ArrayList<>();
+
+    /**
+     * Creates a solver that searches in <code>maze</code> from the
+     * start node to a goal.
+     */
+    public ForkJoinSolver(Maze maze) {
         super(maze);
-        this.forkAfter = forkAfter;
-        this.sharedVisited = ConcurrentHashMap.newKeySet();
-        this.sharedPredecessor = new ConcurrentHashMap<>();
-        this.goalFound = new AtomicBoolean(false);
-        this.taskStart = maze.start();
+        this.visited = new ConcurrentSkipListSet<>();
+        this.predecessor = new ConcurrentHashMap<>();
     }
 
-    private ForkJoinSolver(Maze maze, int start,
-                           int forkAfter,
-                           Set<Integer> visited,
-                           Map<Integer, Integer> predecessor,
-                           AtomicBoolean goalFound) {
-        super(maze);
+    /**
+     * Creates a solver that forks after a number of steps.
+     */
+    public ForkJoinSolver(Maze maze, int forkAfter) {
+        this(maze);
         this.forkAfter = forkAfter;
-        this.sharedVisited = visited;
-        this.sharedPredecessor = predecessor;
-        this.goalFound = goalFound;
-        this.taskStart = start;
+    }
+
+    /**
+     * Creates a solver starting at a specific node, sharing visited nodes and predecessors.
+     */
+    public ForkJoinSolver(Maze maze, int forkAfter, int startNode, Set<Integer> visitedSet,
+                          Map<Integer, Integer> predecessorMap) {
+        this(maze, forkAfter);
+        this.start = startNode;
+        this.visited = visitedSet;
+        this.predecessor = predecessorMap;
     }
 
     @Override
@@ -45,86 +60,92 @@ public class ForkJoinSolver extends SequentialSolver {
         return parallelSearch();
     }
 
+    /**
+     * Performs parallel depth-first search with optional task forking.
+     */
     private List<Integer> parallelSearch() {
-        int playerId = maze.newPlayer(taskStart);
-        Deque<Integer> stack = new ArrayDeque<>();
-        stack.push(taskStart);
 
-        while (!stack.isEmpty() && !goalFound.get()) {
-            int current = stack.pop();
+        int stepsSinceFork = 0;
+        int player = maze.newPlayer(start);
 
-            // tillåt att startnoden alltid utforskas
-            if (current != taskStart && !sharedVisited.add(current))
-                continue;
+        // Stack for DFS
+        Stack<Integer> frontier = new Stack<>();
+        frontier.push(start);
 
-            maze.move(playerId, current);
+        while (!frontier.isEmpty() && !goalFound.get()) {
 
-            // mål hittat
-            if (maze.hasGoal(current)) {
-                goalFound.set(true);
-                return pathFromTo(maze.start(), current);
-            }
+            int currentNode = frontier.pop();
 
-            // samla alla grannar som inte är besökta
-            List<Integer> neighbors = new ArrayList<>();
-            for (int nb : maze.neighbors(current)) {
-                if (!sharedVisited.contains(nb)) {
-                    sharedPredecessor.putIfAbsent(nb, current);
-                    neighbors.add(nb);
+            // Only process if not already visited
+            if (visited.add(currentNode) || currentNode == start) {
+
+                // Move the player to the current node
+                maze.move(player, currentNode);
+
+                // Check if current node is a goal
+                if (maze.hasGoal(currentNode)) {
+                    goalFound.set(true);
+                    return reconstructPath(currentNode);
                 }
-            }
 
-            // vid korsning (>1 möjlig väg): forka
-            if (neighbors.size() > 1) {
-                List<ForkJoinSolver> children = new ArrayList<>();
+                stepsSinceFork++;
+                boolean isFirstNeighbor = true;
 
-                // parent tar första vägen, barn tar resten
-                int first = neighbors.remove(0);
-                stack.push(first);
+                // Explore neighbors
+                for (int neighbor : maze.neighbors(currentNode)) {
 
-                for (int nb : neighbors) {
-                    if (sharedVisited.add(nb)) {
-                        ForkJoinSolver child = new ForkJoinSolver(
-                                maze, nb, forkAfter, sharedVisited, sharedPredecessor, goalFound);
-                        children.add(child);
-                        child.fork();
+                    if (!visited.contains(neighbor)) {
+
+                        // Set predecessor for path reconstruction
+                        predecessor.putIfAbsent(neighbor, currentNode);
+
+                        // Either continue DFS locally or fork a new task
+                        if (isFirstNeighbor || stepsSinceFork < forkAfter) {
+                            frontier.push(neighbor);
+                            isFirstNeighbor = false;
+                        } else {
+                            if (visited.add(neighbor)) {
+                                stepsSinceFork = 0;
+
+                                // Fork new solver for this neighbor
+                                ForkJoinSolver forkedSolver = new ForkJoinSolver(
+                                        maze, forkAfter, neighbor, visited, predecessor);
+
+                                subSolvers.add(forkedSolver);
+                                forkedSolver.fork();
+                            }
+                        }
                     }
                 }
-
-                // vänta på barn — om någon hittar mål, returnera vägen
-                for (ForkJoinSolver child : children) {
-                    List<Integer> res = child.join();
-                    if (res != null) {
-                        return res;
-                    }
-                }
-
-            } else if (neighbors.size() == 1) {
-                // bara en väg — fortsätt sekventiellt
-                stack.push(neighbors.get(0));
             }
-            // annars: dead end → fortsätt poppa
         }
 
-        // 🔧 FIX: Om någon annan tråd hittade målet, försök återskapa vägen
-        if (goalFound.get()) {
-            List<Integer> path = reconstructIfGoalExists();
-            if (path != null) return path;
+        // Join forked solvers
+        for (ForkJoinSolver solver : subSolvers) {
+            List<Integer> result = solver.join();
+
+            if (result != null) {
+                List<Integer> pathToChild = pathFromTo(start, solver.start);
+                pathToChild.addAll(result.subList(1, result.size()));
+                return pathToChild;
+            }
         }
 
         return null;
     }
 
     /**
-     * Hjälpmetod som försöker rekonstruera vägen när en annan tråd hittat mål.
+     * Reconstructs the path from start to the given node.
      */
-    private List<Integer> reconstructIfGoalExists() {
-        // hitta någon nod som har en väg till mål
-        for (Integer id : sharedVisited) {
-            if (maze.hasGoal(id)) {
-                return pathFromTo(maze.start(), id);
-            }
+    private List<Integer> reconstructPath(int node) {
+        List<Integer> path = new ArrayList<>();
+        int current = node;
+
+        while (current != start && predecessor.containsKey(current)) {
+            path.add(0, current); // insert at front
+            current = predecessor.get(current);
         }
-        return null;
+        path.add(0, start);
+        return path;
     }
 }
